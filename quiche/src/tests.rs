@@ -9363,6 +9363,122 @@ fn local_error(#[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str) {
 }
 
 #[rstest]
+fn application_close_skips_handshake_probe(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+
+    // Advance the handshake until the client is established, but has not yet
+    // received HANDSHAKE_DONE from the server.
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    assert!(pipe.client.is_established());
+    assert!(!pipe.client.handshake_confirmed);
+
+    // Model a Handshake PTO expiring before the client closes the connection.
+    let epoch = packet::Epoch::Handshake;
+    pipe.client
+        .paths
+        .get_active_mut()
+        .unwrap()
+        .recovery
+        .inc_loss_probes(epoch);
+
+    assert_eq!(pipe.client.close(true, 0x1234, b"app close"), Ok(()));
+
+    let mut out = [0u8; 65535];
+    let (len, _) = pipe.client.send(&mut out).unwrap();
+
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut out[..len]).unwrap();
+
+    assert_eq!(
+        frames.first(),
+        Some(&frame::Frame::ApplicationClose {
+            error_code: 0x1234,
+            reason: b"app close".to_vec(),
+        })
+    );
+    assert!(pipe.client.is_draining());
+}
+
+#[rstest]
+fn skip_ping_ack_while_closing_handshake(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+
+    // Partial handshake: client sends Initial, then the server responds with
+    // Handshake CRYPTO that remains unacknowledged.
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+    assert!(!pipe.server.is_established());
+    assert!(!pipe.server.handshake_confirmed);
+
+    // Model the server entering local application-close state while Handshake
+    // keys are still available. close(true, ...) cannot create this directly
+    // before establishment because the public API maps it to a transport close.
+    pipe.server.local_error = Some(ConnectionError {
+        is_app: true,
+        error_code: 0x1234,
+        reason: b"app close".to_vec(),
+    });
+
+    // Artificially populate the Handshake ack-needed set so the server has
+    // something to ACK, but clear ack_elicited so ACK generation would only be
+    // driven by ack elicitation.
+    let epoch = packet::Epoch::Handshake;
+    pipe.server.pkt_num_spaces[epoch]
+        .recv_pkt_need_ack
+        .push_item(42);
+    pipe.server.pkt_num_spaces[epoch].ack_elicited = false;
+
+    // Force should_elicit_ack() true. Before closing suppressed ack
+    // elicitation, this made each server emit another Handshake ACK-only
+    // packet because PINGs are suppressed while closing and ACKs are not
+    // ack-eliciting.
+    pipe.server
+        .paths
+        .get_active_mut()
+        .unwrap()
+        .recovery
+        .inc_loss_probes(epoch);
+
+    let mut out = [0u8; 65535];
+    let sent_packets = pipe
+        .server
+        .paths
+        .get_active()
+        .unwrap()
+        .recovery
+        .sent_packets_len(epoch);
+
+    for _ in 0..recovery::MAX_OUTSTANDING_NON_ACK_ELICITING {
+        assert_eq!(pipe.server.send(&mut out), Err(Error::Done));
+        assert_eq!(
+            pipe.server
+                .paths
+                .get_active()
+                .unwrap()
+                .recovery
+                .sent_packets_len(epoch),
+            sent_packets
+        );
+    }
+}
+
+#[rstest]
 fn update_max_datagram_size(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
 ) {
@@ -11965,6 +12081,56 @@ fn consecutive_non_ack_eliciting(
             .any(|frame| matches!(frame, frame::Frame::Ping { mtu_probe: None })),
         "found a PING"
     );
+}
+
+#[rstest]
+fn non_acknowledging_ping_client_accumulates_server_acks(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    let epoch = packet::Epoch::Application;
+    let sent_packets = pipe
+        .server
+        .paths
+        .get_active()
+        .unwrap()
+        .recovery
+        .sent_packets_len(epoch);
+
+    // Model a client that keeps sending ack-eliciting packets, but never reads
+    // or acknowledges anything the server sends back.
+    let frames = [frame::Frame::Ping { mtu_probe: None }];
+    let pkt_type = Type::Short;
+    let ping_count = recovery::MAX_OUTSTANDING_NON_ACK_ELICITING * 2;
+
+    for idx in 0..ping_count {
+        let len = pipe
+            .send_pkt_to_server(pkt_type, &frames, &mut buf)
+            .unwrap();
+        assert!(len > 0);
+
+        let frames =
+            test_utils::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
+        assert!(
+            frames
+                .iter()
+                .any(|frame| matches!(frame, frame::Frame::ACK { .. })),
+            "server response {idx} should acknowledge the client PING"
+        );
+
+        let current_sent_packets = pipe
+            .server
+            .paths
+            .get_active()
+            .unwrap()
+            .recovery
+            .sent_packets_len(epoch);
+        assert_eq!(current_sent_packets, sent_packets + idx + 1);
+    }
 }
 
 #[rstest]
