@@ -673,14 +673,16 @@ impl<H: DriverHooks> H3Driver<H> {
     fn process_h3_fin(
         &mut self, qconn: &mut QuicheConnection, stream_id: u64,
     ) -> H3ConnectionResult<()> {
-        let ctx = self
-            .stream_map
-            .get_mut(&stream_id)
-            .filter(|c| !c.fin_or_reset_recv);
-        let Some(ctx) = ctx else {
-            // Stream is already finished, nothing to do
+        let Some(ctx) = self.stream_map.get_mut(&stream_id) else {
+            // A finished stream without a context can still have a stop to
+            // acknowledge.
+            let _ = qconn.stream_capacity(stream_id);
             return Ok(());
         };
+
+        if ctx.fin_or_reset_recv {
+            return Ok(());
+        }
 
         ctx.fin_or_reset_recv = true;
         ctx.audit_stats
@@ -746,6 +748,9 @@ impl<H: DriverHooks> H3Driver<H> {
                     if ctx.both_directions_done() {
                         return self.cleanup_stream(qconn, stream_id);
                     }
+                } else {
+                    // A reset can finish a stream that never had a context.
+                    let _ = qconn.stream_capacity(stream_id);
                 }
 
                 // TODO: if we don't have the stream in our map: should we
@@ -797,6 +802,12 @@ impl<H: DriverHooks> H3Driver<H> {
         conn: &mut h3::Connection, qconn: &mut QuicheConnection,
         ctx: &mut StreamCtx,
     ) -> h3::Result<()> {
+        if let Err(error @ quiche::Error::StreamStopped(_)) =
+            qconn.stream_capacity(ctx.audit_stats.stream_id())
+        {
+            return Err(h3::Error::TransportError(error));
+        }
+
         let Some(frame) = &mut ctx.queued_frame else {
             return Ok(());
         };
@@ -944,6 +955,9 @@ impl<H: DriverHooks> H3Driver<H> {
 
         match self.stream_map.get_mut(&stream_id) {
             None => Ok(()),
+
+            Some(stream) if stream.fin_or_reset_sent => Ok(()),
+
             Some(stream) => {
                 stream.recv = Some(chan);
                 stream.queued_frame = data;
@@ -1032,9 +1046,16 @@ impl<H: DriverHooks> H3Driver<H> {
     fn cleanup_stream(
         &mut self, qconn: &mut QuicheConnection, stream_id: u64,
     ) -> H3ConnectionResult<()> {
-        let Some(stream_ctx) = self.stream_map.remove(&stream_id) else {
+        let Some(mut stream_ctx) = self.stream_map.remove(&stream_id) else {
             return Ok(());
         };
+
+        // Receive-side cleanup can precede the writable stop notification.
+        if let Err(quiche::Error::StreamStopped(code)) =
+            qconn.stream_capacity(stream_id)
+        {
+            stream_ctx.handle_recvd_stop_sending(code);
+        }
 
         // Find if the stream also has any pending futures associated with it
         for pending in self.waiting_streams.iter_mut() {
@@ -1199,7 +1220,12 @@ impl<H: DriverHooks> H3Driver<H> {
         // Split self borrow between conn and stream_map
         let conn = self.conn.as_mut().ok_or(Self::connection_not_present())?;
         let Some(ctx) = self.stream_map.get_mut(&stream_id) else {
-            return Ok(()); // Unknown stream_id
+            // Keep the stop pending while headers can still create a context.
+            if qconn.stream_finished(stream_id) {
+                let _ = qconn.stream_capacity(stream_id);
+            }
+
+            return Ok(());
         };
 
         loop {
@@ -1222,6 +1248,24 @@ impl<H: DriverHooks> H3Driver<H> {
                     e,
                 ))) => {
                     ctx.handle_recvd_stop_sending(e);
+
+                    // An idle stream's outbound receiver can be owned by a
+                    // waiting future instead of ctx.recv. Close it so the
+                    // application cannot send another frame.
+                    for pending in self.waiting_streams.iter_mut() {
+                        let WaitForStream::Downstream(wait) = pending else {
+                            continue;
+                        };
+
+                        if wait.stream_id != stream_id {
+                            continue;
+                        }
+
+                        if let Some(recv) = wait.chan.as_mut() {
+                            recv.close();
+                        }
+                    }
+
                     if ctx.both_directions_done() {
                         return self.cleanup_stream(qconn, stream_id);
                     } else {

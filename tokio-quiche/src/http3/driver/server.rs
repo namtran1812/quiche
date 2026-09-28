@@ -250,7 +250,9 @@ impl ServerHooks {
             .map_err(|_| H3ConnectionError::ControllerWentAway)?;
         driver.hooks.requests += 1;
 
-        Ok(())
+        // A STOP_SENDING received before HEADERS had no stream context for
+        // the writable pass to update. Reconcile it now that one exists.
+        driver.process_writable_stream(qconn, stream_id)
     }
 }
 
