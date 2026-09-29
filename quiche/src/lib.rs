@@ -8271,6 +8271,21 @@ impl<F: BufFactory> Connection<F> {
         )
     }
 
+    /// Gets or creates a stream referenced by a received frame.
+    fn get_or_create_stream_for_received_frame(
+        &mut self, id: u64,
+    ) -> Result<&mut stream::Stream<F>> {
+        let local = stream::is_local(id, self.is_server);
+
+        // Opening a higher-numbered stream also opens lower streams of the
+        // same type, even if they do not have Stream objects yet.
+        if local && !self.streams.local_stream_opened(id) {
+            return Err(Error::InvalidStreamState(id));
+        }
+
+        self.get_or_create_stream(id, local)
+    }
+
     /// Processes an incoming frame.
     fn process_frame(
         &mut self, frame: frame::Frame, hdr: &Header, recv_path_id: usize,
@@ -8382,7 +8397,9 @@ impl<F: BufFactory> Connection<F> {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
-                let stream = match self.get_or_create_stream(stream_id, false) {
+                let stream = match self
+                    .get_or_create_stream_for_received_frame(stream_id)
+                {
                     Ok(v) => v,
 
                     Err(Error::Done) => return Ok(()),
@@ -8436,7 +8453,9 @@ impl<F: BufFactory> Connection<F> {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
-                let stream = match self.get_or_create_stream(stream_id, false) {
+                let stream = match self
+                    .get_or_create_stream_for_received_frame(stream_id)
+                {
                     Ok(v) => v,
 
                     Err(Error::Done) => return Ok(()),
@@ -8549,7 +8568,9 @@ impl<F: BufFactory> Connection<F> {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
-                let stream = match self.get_or_create_stream(stream_id, false) {
+                let stream = match self
+                    .get_or_create_stream_for_received_frame(stream_id)
+                {
                     Ok(v) => v,
 
                     Err(Error::Done) => return Ok(()),
@@ -8611,7 +8632,9 @@ impl<F: BufFactory> Connection<F> {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
-                let stream = match self.get_or_create_stream(stream_id, false) {
+                let stream = match self
+                    .get_or_create_stream_for_received_frame(stream_id)
+                {
                     Ok(v) => v,
 
                     Err(Error::Done) => return Ok(()),
